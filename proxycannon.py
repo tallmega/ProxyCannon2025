@@ -18,7 +18,7 @@ import re
 import signal
 import subprocess
 import time
-import boto.ec2
+import boto3
 import netifaces as netifaces
 import random
 import threading
@@ -55,6 +55,56 @@ def debug(msg):
     if args.v:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print("[i] " + str(timestamp) + " : " + str(msg))
+
+
+ec2_resource = None
+ec2_client = None
+SSH_COMMON_OPTS = "-o StrictHostKeyChecking=no -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa"
+
+
+def build_boto3_filters(filter_dict):
+    filters = []
+    if not filter_dict:
+        return filters
+    for name, value in filter_dict.items():
+        if isinstance(value, list):
+            values = [str(v) for v in value]
+        else:
+            values = [str(value)]
+        filters.append({'Name': name, 'Values': values})
+    return filters
+
+
+def get_instances(filter_dict):
+    if ec2_resource is None:
+        return []
+    boto_filters = build_boto3_filters(filter_dict)
+    return list(ec2_resource.instances.filter(Filters=boto_filters))
+
+
+def get_addresses(filter_dict=None):
+    if ec2_client is None:
+        return []
+    params = {}
+    boto_filters = build_boto3_filters(filter_dict or {})
+    if boto_filters:
+        params['Filters'] = boto_filters
+    response = ec2_client.describe_addresses(**params)
+    return response.get('Addresses', [])
+
+
+def release_address(address):
+    if ec2_client is None or not address:
+        return
+    allocation_id = address.get('AllocationId')
+    public_ip = address.get('PublicIp')
+    try:
+        if allocation_id:
+            ec2_client.release_address(AllocationId=allocation_id)
+        elif public_ip:
+            ec2_client.release_address(PublicIp=public_ip)
+    except Exception as e:
+        error("Release of elastic IP failed because %s" % e)
 
 
 ########################################################################################################################
@@ -153,40 +203,40 @@ def cleanup(proxy=None, cannon=None):
     ####################################################################################################################
 
     debug("Getting objects ready for termination at the cloud")
-    cleanup_instances = conn.get_only_instances(
-        filters={"tag:Name": nameTag, "instance-state-name": "running"})
+    cleanup_instances = get_instances({"tag:Name": nameTag, "instance-state-name": "running"})
     if cleanup_instances:
         # Terminate instances
         success("Terminating Instances.....")
         for instance in cleanup_instances:
+            instance.reload()
             debug("Attempting to terminate instance: %s" % str(instance.id))
             instance.terminate()
 
         warning("Pausing for 120 seconds so instances can properly terminate.....")
         time.sleep(120)
-    conn.get_all_addresses(filters={"tag:Name": nameTag})
 
     # Detect Elastic IPs and remove them if needed
-    success("Deleting Amazon Security Groups.....")
+    success("Releasing Elastic IP addresses.....")
     try:
-        elastic_ips = conn.get_all_addresses(filters={"tag:Name": nameTag})
+        elastic_ips = get_addresses({"tag:Name": nameTag})
         for elastic_ip in elastic_ips:
-            conn.release_address(elastic_ip)
+            release_address(elastic_ip)
     except Exception as e:
         error("Release of elastic IP failed because %s" % e)
 
     # Remove Security Groups
     success("Deleting Amazon Security Groups.....")
     try:
-
-        conn.delete_security_group(name=securityGroup)
+        if ec2_client:
+            ec2_client.delete_security_group(GroupName=securityGroup)
     except Exception as e:
         error("Deletion of security group failed because %s" % e)
 
     # Remove Key Pairs
     success("Removing SSH keys.....")
     try:
-        conn.delete_key_pair(key_name=keyName)
+        if ec2_client:
+            ec2_client.delete_key_pair(KeyName=keyName)
     except Exception as e:
         error("Deletion of key pair failed because %s" % e)
 
@@ -209,11 +259,17 @@ def cleanup(proxy=None, cannon=None):
 # Connect to AWS EC2
 ########################################################################################################################
 def connect_to_ec2():
-    EC2conn = None
+    global ec2_resource
+    global ec2_client
     try:
         debug("Connecting to Amazon's EC2.")
-        EC2conn = boto.ec2.connect_to_region(region_name=args.region, aws_access_key_id=aws_access_key_id,
-                                             aws_secret_access_key=aws_secret_access_key)
+        session = boto3.Session(
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            region_name=args.region
+        )
+        ec2_resource = session.resource('ec2')
+        ec2_client = session.client('ec2')
     except Exception as e:
         warning("Failed to connect to Amazon EC2 because: %s" % e)
         warning("Continue? (y/n)")
@@ -226,7 +282,7 @@ def connect_to_ec2():
             else:
                 cleanup()
                 exit("Cleaning complete, shutting down")
-    return EC2conn
+    return ec2_resource, ec2_client
 
 
 ########################################################################################################################
@@ -252,17 +308,18 @@ def rotate_host(target_tunnel_id, show_log=True):
         exit()
 
     # get list of instances
-    ipfilter_instances = None
+    ipfilter_instances = []
     try:
-        ipfilter_instances = conn.get_only_instances(
-            filters={"tag:Name": nameTag, "instance-state-name": "running"})
+        ipfilter_instances = get_instances({"tag:Name": nameTag, "instance-state-name": "running"})
     except Exception as e:
         error("Failed to get instances because: %s (ipfilter_reservations)." % e)
 
     # get public IP's assigned to instances
     ipfilter = []
     for ipfilter_instance in ipfilter_instances:
-        ipfilter.append(ipfilter_instance.ip_address)
+        ipfilter_instance.reload()
+        if ipfilter_instance.public_ip_address:
+            ipfilter.append(ipfilter_instance.public_ip_address)
     if show_log:
         debug("Public IP's for all instances: " + str(ipfilter))
 
@@ -371,15 +428,27 @@ def rotate_host(target_tunnel_id, show_log=True):
     if show_log:
         debug("Requesting new temporary Elastic IP address... This can take a while (tun%s)" % target_tunnel_id)
     temporary_address = None
+    association_id = None
     try:
-        temporary_address = conn.allocate_address()
-    except Exception as e:
-        error("Failed to obtain a new temporary address for tun%s because: " + str(e) % target_tunnel_id)
-    if show_log:
-        debug("Temporary Elastic IP address: %s (tun%s)" % (temporary_address.public_ip, target_tunnel_id))
+        temporary_address = ec2_client.allocate_address(Domain='vpc')
+    except Exception:
+        try:
+            temporary_address = ec2_client.allocate_address(Domain='standard')
+        except Exception as e:
+            error("Failed to obtain a new temporary address for tun%s because: %s" % (target_tunnel_id, str(e)))
+    if show_log and temporary_address:
+        debug("Temporary Elastic IP address: %s (tun%s)" % (temporary_address.get('PublicIp'), target_tunnel_id))
 
     # Associating new temporary address
-    conn.associate_address(tunnels[target_tunnel_id]['cloud_id'], temporary_address.public_ip)
+    if temporary_address:
+        try:
+            association_response = ec2_client.associate_address(
+                InstanceId=tunnels[target_tunnel_id]['cloud_id'],
+                AllocationId=temporary_address.get('AllocationId')
+            )
+            association_id = association_response.get('AssociationId')
+        except Exception as e:
+            error("Failed to associate temporary address for tun%s because: %s" % (target_tunnel_id, str(e)))
 
     # At this point, your VM should respond on its public ip address.
     # NOTE: It may take up to 60 seconds for the temporary Elastic IP address to begin working
@@ -389,18 +458,27 @@ def rotate_host(target_tunnel_id, show_log=True):
 
     # Remove temporary IP association forcing a new permanent public IP
     try:
-        conn.disassociate_address(temporary_address.public_ip)
+        if association_id:
+            ec2_client.disassociate_address(AssociationId=association_id)
+        elif temporary_address and temporary_address.get('PublicIp'):
+            ec2_client.disassociate_address(PublicIp=temporary_address.get('PublicIp'))
     except Exception as e:
-        error("Failed to disassociate the address " + str(temporary_address.public_ip) + " because: " + str(e))
+        error("Failed to disassociate the address %s because: %s" %
+              (str(temporary_address.get('PublicIp') if temporary_address else 'unknown'), str(e)))
     if show_log:
         debug("Sleeping for 60s to allow for new permanent IP to take effect (tun%s)" % target_tunnel_id)
     time.sleep(60)
 
     # Return the temporary IP address back to address pool
     try:
-        conn.release_address(allocation_id=temporary_address.allocation_id)
+        if temporary_address:
+            if temporary_address.get('AllocationId'):
+                ec2_client.release_address(AllocationId=temporary_address.get('AllocationId'))
+            elif temporary_address.get('PublicIp'):
+                ec2_client.release_address(PublicIp=temporary_address.get('PublicIp'))
     except Exception as e:
-        error("Failed to release the address " + str(temporary_address.public_ip) + " because: " + str(e))
+        error("Failed to release the address %s because: %s" %
+              (str(temporary_address.get('PublicIp') if temporary_address else 'unknown'), str(e)))
 
     if show_log:
         debug("Rotate host completed for tun%s" % target_tunnel_id)
@@ -417,13 +495,14 @@ def rotate_host(target_tunnel_id, show_log=True):
     if show_log:
         debug("Refreshing our local list of instances from the cloud provider to identify new permanent IP (tun%s)" %
               target_tunnel_id)
-    ip_list_instances = conn.get_only_instances(
-        filters={"tag:Name": nameTag, "instance-state-name": "running"})
+    ip_list_instances = get_instances({"tag:Name": nameTag, "instance-state-name": "running"})
 
     # Grab list of public IP's assigned to instances that were launched
     all_addresses = []
     for ip_list_instance in ip_list_instances:
-        all_addresses.append(ip_list_instance.ip_address)
+        ip_list_instance.reload()
+        if ip_list_instance.public_ip_address:
+            all_addresses.append(ip_list_instance.public_ip_address)
     if show_log:
         debug("Public IP's for all instances: " + str(all_addresses))
 
@@ -451,7 +530,7 @@ def rotate_host(target_tunnel_id, show_log=True):
         if exit_threads:
             return
 
-        sshbasecmd = "ssh -i %s/.ssh/%s.pem -o StrictHostKeyChecking=no ubuntu@%s " % (homeDir, keyName, swapped_ip)
+        sshbasecmd = "ssh -i %s/.ssh/%s.pem %s ubuntu@%s " % (homeDir, keyName, SSH_COMMON_OPTS, swapped_ip)
 
         # Add static routes for new IP to tunnel
         run_sys_cmd("Dummy SSH connection for new ECDSA keys (tun%s)" % target_tunnel_id, False,
@@ -488,8 +567,9 @@ def rotate_host(target_tunnel_id, show_log=True):
                         (target_tunnel_id, target_tunnel_id), show_log=show_log)
 
         # Establish tunnel
-        sshcmd = "ssh -i %s/.ssh/%s.pem -o StrictHostKeyChecking=no -w %s:%s -o TCPKeepAlive=yes -o " \
-                 "ServerAliveInterval=50 ubuntu@%s &" % (homeDir, keyName, target_tunnel_id, target_tunnel_id, swapped_ip)
+        sshcmd = "ssh -i %s/.ssh/%s.pem %s -w %s:%s -o TCPKeepAlive=yes -o " \
+                 "ServerAliveInterval=50 ubuntu@%s &" % (homeDir, keyName, SSH_COMMON_OPTS, target_tunnel_id,
+                                                        target_tunnel_id, swapped_ip)
         if show_log:
             debug('SHELL CMD (remote): %s (tun%s)' % (sshcmd, target_tunnel_id))
         retry_cnt = 0
@@ -746,22 +826,49 @@ def main():
     if not os.path.exists("%s/.ssh" % homeDir):
         os.makedirs("%s/.ssh" % homeDir)
         debug("Created %s/.ssh directory" % homeDir)
-    keypair = conn.create_key_pair(keyName)
-    keypair.material = keypair.material.encode()
-    keypair.save("%s/.ssh" % homeDir)
+    key_path = "%s/.ssh/%s.pem" % (homeDir, keyName)
+    try:
+        keypair_response = ec2_client.create_key_pair(KeyName=keyName)
+        key_material = keypair_response.get('KeyMaterial', '')
+        with open(key_path, 'w') as key_file:
+            key_file.write(key_material)
+        os.chmod(key_path, 0o600)
+    except Exception as e:
+        error("Generating SSH key pair failed because: %s" % e)
+        exit()
     debug("SSH Key Pair Name " + keyName)
     time.sleep(5)
     success("Generating Amazon Security Group...")
-    sg = None
+    security_group_id = None
     try:
-        sg = conn.create_security_group(name=securityGroup, description="Used for proxyCannon")
+        sg_response = ec2_client.create_security_group(GroupName=securityGroup, Description="Used for proxyCannon")
+        security_group_id = sg_response.get('GroupId')
     except Exception as e:
         error("Generating Amazon Security Group failed because: %s" % e)
         exit()
 
     time.sleep(5)
     try:
-        sg.authorize(ip_protocol="tcp", from_port=22, to_port=22, cidr_ip="0.0.0.0/0")
+        if security_group_id:
+            ec2_client.authorize_security_group_ingress(
+                GroupId=security_group_id,
+                IpPermissions=[{
+                    'IpProtocol': 'tcp',
+                    'FromPort': 22,
+                    'ToPort': 22,
+                    'IpRanges': [{'CidrIp': '0.0.0.0/0'}]
+                }]
+            )
+        else:
+            ec2_client.authorize_security_group_ingress(
+                GroupName=securityGroup,
+                IpPermissions=[{
+                    'IpProtocol': 'tcp',
+                    'FromPort': 22,
+                    'ToPort': 22,
+                    'IpRanges': [{'CidrIp': '0.0.0.0/0'}]
+                }]
+            )
     except Exception as e:
         error("Generating Amazon Security Group failed because: %s" % e)
         exit()
@@ -769,11 +876,20 @@ def main():
     debug("Security Group Name: " + securityGroup)
 
     # Launch Amazon Instances
-    reservations = None
+    reservation_response = None
     try:
-        reservations = conn.run_instances(args.image_id, key_name=keyName, min_count=args.num_of_instances,
-                                          max_count=args.num_of_instances, instance_type=args.image_type,
-                                          security_groups=[securityGroup])
+        run_instance_params = {
+            'ImageId': args.image_id,
+            'KeyName': keyName,
+            'MinCount': args.num_of_instances,
+            'MaxCount': args.num_of_instances,
+            'InstanceType': args.image_type
+        }
+        if security_group_id:
+            run_instance_params['SecurityGroupIds'] = [security_group_id]
+        else:
+            run_instance_params['SecurityGroups'] = [securityGroup]
+        reservation_response = ec2_client.run_instances(**run_instance_params)
     except Exception as e:
         error("Failed to start new instance: %s" % e)
         error("There may be config in your AWS console to tidy up but no local changes were made")
@@ -789,20 +905,26 @@ def main():
         time.sleep(11.5)
     print("\n")
     # Add tag name to instance for better management
-    for instance in reservations.instances:
-        instance.add_tag("Name", nameTag)
+    if reservation_response:
+        instance_ids = [instance_data['InstanceId'] for instance_data in reservation_response.get('Instances', [])]
+        if instance_ids:
+            try:
+                ec2_client.create_tags(Resources=instance_ids, Tags=[{'Key': 'Name', 'Value': nameTag}])
+            except Exception as e:
+                warning("Failed to tag instances because: %s" % e)
     debug("Tag Name: " + nameTag)
 
     # Grab list of public IP's assigned to instances that were launched
-    instances = conn.get_only_instances(filters={"tag:Name": nameTag, "instance-state-name": "running"})
+    instances = get_instances({"tag:Name": nameTag, "instance-state-name": "running"})
     public_ips = ''
     tunnel_id = 0
     for instance in instances:
-        tunnels[tunnel_id] = {'cloud_id': instance.id, 'pub_ip': instance.ip_address,
+        instance.reload()
+        tunnels[tunnel_id] = {'cloud_id': instance.id, 'pub_ip': instance.public_ip_address,
                               'tunnel_pid': None, 'route_active': False,
                               'tunnel_active': False, 'link_state_active': True,
                               'tunnel_works': True, 'rotating_ip': False}
-        public_ips = public_ips + instance.ip_address + " "
+        public_ips = public_ips + str(instance.public_ip_address) + " "
         tunnel_id += 1
     debug("Public IP's for all instances: %s" % public_ips)
 
@@ -810,8 +932,8 @@ def main():
     success("Provisioning Hosts.....")
     for tunnel_id, tunnel in tunnels.items():
         log(tunnels[tunnel_id]['pub_ip'])
-        sshbasecmd = "ssh -i %s/.ssh/%s.pem -o StrictHostKeyChecking=no ubuntu@%s " % (
-            homeDir, keyName, tunnels[tunnel_id]['pub_ip'])
+        sshbasecmd = "ssh -i %s/.ssh/%s.pem %s ubuntu@%s " % (
+            homeDir, keyName, SSH_COMMON_OPTS, tunnels[tunnel_id]['pub_ip'])
 
         # Enable Tunneling on the remote host
         run_sys_cmd("Enabling tunneling via SSH on %s (tun%s)" % (tunnels[tunnel_id]['pub_ip'], tunnel_id), False, sshbasecmd +
@@ -859,9 +981,9 @@ def main():
         time.sleep(0.5)
 
         # Establish tunnel interface
-        sshcmd = "ssh -i %s/.ssh/%s.pem -w %s:%s -o StrictHostKeyChecking=no -o TCPKeepAlive=yes -o " \
+        sshcmd = "ssh -i %s/.ssh/%s.pem %s -w %s:%s -o TCPKeepAlive=yes -o " \
                  "ServerAliveInterval=50 ubuntu@%s &" % \
-                 (homeDir, keyName, tunnel_id, tunnel_id, tunnels[tunnel_id]['pub_ip'])
+                 (homeDir, keyName, SSH_COMMON_OPTS, tunnel_id, tunnel_id, tunnels[tunnel_id]['pub_ip'])
         debug("SHELL CMD (remote): " + sshcmd)
         retry_cnt = 0
         while retry_cnt < 6:
@@ -1097,7 +1219,7 @@ run_sys_cmd("Adding static routes to EC2 control", True, localcmdsudoprefix +
             "ip route add %s via %s dev %s" % (ec2_ip, defaultgateway, networkInterface))
 
 # Initialize connection to EC2
-conn = connect_to_ec2()
+ec2_resource, ec2_client = connect_to_ec2()
 
 # Define SigTerm Handler
 signal.signal(signal.SIGINT, cleanup)

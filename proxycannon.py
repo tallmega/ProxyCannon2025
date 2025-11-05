@@ -60,6 +60,7 @@ def debug(msg):
 ec2_resource = None
 ec2_client = None
 SSH_COMMON_OPTS = "-o StrictHostKeyChecking=no -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa"
+original_hash_policy = None
 
 
 def build_boto3_filters(filter_dict):
@@ -151,6 +152,7 @@ def cleanup(proxy=None, cannon=None):
     # set the exit flag
     global exit_threads
     global tunnels
+    global original_hash_policy
     exit_threads = True
 
     ####################################################################################################################
@@ -197,6 +199,11 @@ def cleanup(proxy=None, cannon=None):
 
     # remove iptables saved config
     run_sys_cmd("Removing local iptables save state", True, localcmdsudoprefix + "rm -rf  /tmp/%s" + iptablesName)
+
+    # Restore hash policy if we changed it during cache busting
+    if args.b and original_hash_policy is not None:
+        run_sys_cmd("Restoring multipath hash policy", True, localcmdsudoprefix +
+                    "sysctl -w net.ipv4.fib_multipath_hash_policy=%s" % original_hash_policy)
 
     ####################################################################################################################
     # Cleaning up cloud aspects
@@ -812,6 +819,7 @@ def get_default_gateway_linux():
 # Generate sshkeyname
 def main():
     global tunnels
+    global original_hash_policy
     # Display Warning
     print("\n++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
     print("+ This script will clear out any existing iptable and routing rules. +")
@@ -820,6 +828,17 @@ def main():
     confirm = input()
     if confirm.lower() != "y":
         exit("Yeah you're right its probably better to play it safe.")
+
+    if args.b:
+        current_policy = run_sys_cmd("Reading current multipath hash policy", True,
+                                     "sysctl -n net.ipv4.fib_multipath_hash_policy", show_log=False)
+        if current_policy:
+            original_hash_policy = current_policy.strip()
+        if original_hash_policy != '1':
+            run_sys_cmd("Enabling L4-aware multipath hashing for cache busting", True, localcmdsudoprefix +
+                        "sysctl -w net.ipv4.fib_multipath_hash_policy=1")
+        else:
+            debug("Multipath hash policy already L4-aware")
 
     # Generate KeyPair
     debug("Generating ssh keypairs...")

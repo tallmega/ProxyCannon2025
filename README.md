@@ -1,7 +1,7 @@
 # ProxyCannon-2025
 This repo is a fork of a revival script by yg-ht which is a fork of a single script by Shellntel in their repo "scripts". 
 
-### Why bother
+### Why bother?
 
 AWS has updated its terms to state that outbound use of API Gateway is prohibited and I want to rotate my source IP.
 
